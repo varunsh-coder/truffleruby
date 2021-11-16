@@ -62,7 +62,7 @@ public abstract class CallInternalMethodNode extends RubyBaseNode {
             InternalMethod method, Object receiver, Object[] rubyArgs, LiteralCallNode literalCallNode,
             @Cached("method.getCallTarget()") RootCallTarget cachedCallTarget,
             @Cached("method") InternalMethod cachedMethod,
-            @Cached("createCall(cachedMethod.getName(), cachedCallTarget)") DirectCallNode callNode) {
+            @Cached("createCall(cachedCallTarget)") DirectCallNode callNode) {
         if (literalCallNode != null) {
             literalCallNode.copyRuby2KeywordsHash(rubyArgs, cachedMethod.getSharedMethodInfo());
         }
@@ -70,7 +70,26 @@ public abstract class CallInternalMethodNode extends RubyBaseNode {
         return callNode.call(RubyArguments.repackForCall(rubyArgs));
     }
 
-    @Specialization(guards = "!method.alwaysInlined()", replaces = "callCached")
+    @Specialization(
+            guards = {
+                    "!isSingleContext()",
+                    "method.getCallTarget() == cachedCallTarget",
+                    "cachedMethodNotAlwaysInlined" },
+            limit = "getCacheLimit()")
+    protected Object callCachedMultiContext(
+            InternalMethod method, Object receiver, Object[] rubyArgs, LiteralCallNode literalCallNode,
+            @Cached("method.getCallTarget()") RootCallTarget cachedCallTarget,
+            @Cached("!method.alwaysInlined()") boolean cachedMethodNotAlwaysInlined,
+            @Cached("method.getSharedMethodInfo()") SharedMethodInfo cachedSharedMethodInfo,
+            @Cached("createCall(cachedCallTarget)") DirectCallNode callNode) {
+        if (literalCallNode != null) {
+            literalCallNode.copyRuby2KeywordsHash(rubyArgs, cachedSharedMethodInfo);
+        }
+
+        return callNode.call(RubyArguments.repackForCall(rubyArgs));
+    }
+
+    @Specialization(guards = "!method.alwaysInlined()", replaces = { "callCached", "callCachedMultiContext" })
     protected Object callUncached(
             InternalMethod method, Object receiver, Object[] rubyArgs, LiteralCallNode literalCallNode,
             @Cached IndirectCallNode indirectCallNode) {
@@ -186,11 +205,11 @@ public abstract class CallInternalMethodNode extends RubyBaseNode {
         return getLanguage().options.DISPATCH_CACHE;
     }
 
-    protected DirectCallNode createCall(String methodName, RootCallTarget callTarget) {
+    protected DirectCallNode createCall(RootCallTarget callTarget) {
         final DirectCallNode callNode = DirectCallNode.create(callTarget);
         final DispatchNode dispatch = NodeUtil.findParent(this, DispatchNode.class);
         if (dispatch != null) {
-            dispatch.applySplittingInliningStrategy(callTarget, methodName, callNode);
+            dispatch.applySplittingInliningStrategy(callTarget, callNode);
         }
         return callNode;
     }
