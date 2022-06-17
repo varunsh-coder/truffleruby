@@ -9,6 +9,7 @@
  */
 package org.truffleruby.language.methods;
 
+import com.oracle.truffle.api.Assumption;
 import com.oracle.truffle.api.dsl.ImportStatic;
 import org.truffleruby.RubyContext;
 import org.truffleruby.collections.SharedIndicesMap;
@@ -31,6 +32,7 @@ import com.oracle.truffle.api.dsl.Specialization;
 import com.oracle.truffle.api.frame.Frame;
 import com.oracle.truffle.api.profiles.ConditionProfile;
 
+import java.util.Arrays;
 import java.util.Map;
 
 /** Caches {@link ModuleOperations#lookupMethodCached(RubyModule, String, DeclarationContext)} on an actual instance. */
@@ -44,6 +46,28 @@ public abstract class LookupMethodNode extends RubyBaseNode {
     }
 
     public abstract InternalMethod execute(Frame frame, RubyClass metaClass, String name, DispatchConfiguration config);
+
+    @Specialization(
+            // no need to guard on the context, the metaClass is context-specific
+            guards = {
+                    "isSingleContext()",
+                    "metaClass == cachedMetaClass",
+                    "getRefinements(frame, cachedConfig) == NO_REFINEMENTS",
+                    "name == cachedName",
+                    "config == cachedConfig" },
+            assumptions = "methodLookupResult.getAssumptions()",
+            limit = "getCacheLimit()")
+    protected InternalMethod lookupMethodSingleVTableCached(
+            Frame frame, RubyClass metaClass, String name, DispatchConfiguration config,
+            @Cached("metaClass") RubyClass cachedMetaClass,
+            @Cached("name") String cachedName,
+            @Cached("config") DispatchConfiguration cachedConfig,
+            @Cached("metaClass.methodNamesToIndex") SharedIndicesMap cachedMethodNamesToIndex,
+            @Cached("cachedMethodNamesToIndex.lookup(name)") Integer index,
+            @Cached("lookupCachedVTable(getContext(), frame, cachedMetaClass, config, index)") MethodLookupResult methodLookupResult) {
+
+        return methodLookupResult.getMethod();
+    }
 
     @Specialization(
             guards = {
@@ -95,7 +119,8 @@ public abstract class LookupMethodNode extends RubyBaseNode {
         return methodLookupResult.getMethod();
     }
 
-    @Specialization(replaces = { "lookupMethodCached", "lookupMethodRefinementsCached" })
+    @Specialization(
+            replaces = { "lookupMethodCached", "lookupMethodRefinementsCached", "lookupMethodSingleVTableCached" })
     protected InternalMethod lookupMethodUncached(
             Frame frame, RubyClass metaClass, String name, DispatchConfiguration config,
             @Cached MetaClassNode metaClassNode,
@@ -164,6 +189,53 @@ public abstract class LookupMethodNode extends RubyBaseNode {
 
             if (!isVisibleProfile.profile(method.isProtectedMethodVisibleTo(callerClass))) {
                 return null;
+            }
+        }
+
+        return method;
+    }
+
+    protected static MethodLookupResult lookupCachedVTable(RubyContext context, Frame callingFrame,
+            RubyClass metaClass, DispatchConfiguration config, Integer index) {
+        CompilerAsserts.neverPartOfCompilation("slow-path method lookup should not be compiled");
+
+        final int len = metaClass.methodVTable.length;
+        assert len == metaClass.methodAssumptions.length;
+
+        if (index >= len) {
+            final int newLength = Math.max(10, Math.max(len * 2, index + 1));
+            metaClass.methodVTable = Arrays.copyOf(metaClass.methodVTable, newLength);
+            metaClass.methodAssumptions = Arrays.copyOf(metaClass.methodAssumptions, newLength);
+            metaClass.methodAssumptions[index] = Assumption.create();
+        }
+
+        final InternalMethod internalMethod = metaClass.methodVTable[index];
+        final Assumption assumption = metaClass.methodAssumptions[index];
+        final MethodLookupResult method = new MethodLookupResult(internalMethod, assumption);
+
+        if (!method.isDefined()) {
+            return method.withNoMethod();
+        }
+
+        // Check visibility
+        if (!config.ignoreVisibility) {
+            final Visibility visibility = method.getMethod().getVisibility();
+            if (visibility == Visibility.PUBLIC) {
+                return method;
+            }
+
+            if (config.onlyLookupPublic) {
+                return method.withNoMethod();
+            }
+
+            if (visibility == Visibility.PRIVATE) {
+                // A private method may only be called with an implicit receiver.
+                return method.withNoMethod();
+            }
+
+            final RubyClass callerClass = getCallerClass(context, callingFrame);
+            if (!method.getMethod().isProtectedMethodVisibleTo(callerClass)) {
+                return method.withNoMethod();
             }
         }
 
